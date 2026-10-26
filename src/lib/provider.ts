@@ -155,58 +155,104 @@ interface RawModel {
   owned_by?: string;
 }
 
-/** Fetch the model list from an [OI]-compatible /models endpoint. */
-export async function listModels(
-  baseUrl: string,
-  apiKey: string,
-  timeoutMs = 15000,
-): Promise<ProviderModel[]> {
-  const root = normalizeBaseUrl(baseUrl);
-  if (!root) throw new ProviderError('Add a base URL for your provider first.', 0);
+/** CORS proxy used when a provider's /models endpoint blocks browser origins. */
+const CORS_PROXY = 'https://proxy.shakespeare.diy/?url={href}';
 
+function proxiedUrl(url: string): string {
+  return CORS_PROXY.replace('{href}', encodeURIComponent(url));
+}
+
+/** Fetch JSON with a timeout. Returns null on network/CORS failure. */
+async function fetchJson(url: string, apiKey: string, timeoutMs: number): Promise<Response | null> {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs,
-  );
-
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${root}/models`, {
+    return await fetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey.trim()}`, Accept: 'application/json' },
       signal: controller.signal,
     });
-
-    if (!response.ok) {
-      let message = `HTTP ${response.status}`;
-      try {
-        const body = (await response.json()) as { error?: { message?: string }; message?: string };
-        message = body?.error?.message ?? body?.message ?? message;
-      } catch {
-        // Non-JSON error body.
-      }
-      throw new ProviderError(message, response.status);
-    }
-
-    const payload = (await response.json()) as { data?: RawModel[] } | RawModel[];
-    const rows = Array.isArray(payload) ? payload : payload.data ?? [];
-
-    return rows
-      .filter((m): m is RawModel & { id: string } => typeof m?.id === 'string' && m.id.length > 0)
-      .map((m) => ({
-        id: m.id,
-        name: m.name?.trim() || m.id,
-        context: m.context_window ?? m.context_length,
-        ownedBy: m.owned_by,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new ProviderError('The model list request timed out. Check the base URL and try again.', 0);
-    }
-    throw error;
+    // Network error, CORS block, or timeout — let the caller try a fallback.
+    console.warn(`Request failed: ${url}`, error);
+    return null;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** Parse an [OI]-compatible /models payload. */
+function parseModelsPayload(payload: { data?: RawModel[] } | RawModel[]): ProviderModel[] {
+  const rows = Array.isArray(payload) ? payload : payload.data ?? [];
+  return rows
+    .filter((m): m is RawModel & { id: string } => typeof m?.id === 'string' && m.id.length > 0)
+    .map((m) => ({
+      id: m.id,
+      name: m.name?.trim() || m.id,
+      context: m.context_window ?? m.context_length,
+      ownedBy: m.owned_by,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Extract a readable message from a failed response. */
+async function extractErrorMessage(response: Response): Promise<string> {
+  let message = `HTTP ${response.status}`;
+  try {
+    const body = (await response.json()) as { error?: { message?: string }; message?: string };
+    message = body?.error?.message ?? body?.message ?? message;
+  } catch {
+    // Non-JSON error body.
+  }
+  return message;
+}
+
+/**
+ * Fetch the model list from an [OI]-compatible /models endpoint.
+ * Tries the provider directly; if that fails (CORS, timeout, network), retries
+ * through the CORS proxy before giving up.
+ */
+export async function listModels(
+  baseUrl: string,
+  apiKey: string,
+  timeoutMs = 12000,
+): Promise<ProviderModel[]> {
+  const root = normalizeBaseUrl(baseUrl);
+  if (!root) throw new ProviderError('Add a base URL for your provider first.', 0);
+
+  const target = `${root}/models`;
+
+  // Pass 1: direct request.
+  let response = await fetchJson(target, apiKey, timeoutMs);
+
+  // Pass 2: proxy fallback for CORS-blocked or unreachable endpoints.
+  let usedProxy = false;
+  if (!response) {
+    usedProxy = true;
+    response = await fetchJson(proxiedUrl(target), apiKey, timeoutMs);
+  }
+
+  if (!response) {
+    throw new ProviderError(
+      `Could not reach ${root}/models from the browser. Check the base URL, and note that some providers block browser requests entirely — you can still enter the model id manually.`,
+      0,
+    );
+  }
+
+  if (!response.ok) {
+    throw new ProviderError(await extractErrorMessage(response), response.status);
+  }
+
+  try {
+    const payload = (await response.json()) as { data?: RawModel[] } | RawModel[];
+    return parseModelsPayload(payload);
+  } catch {
+    throw new ProviderError(
+      usedProxy
+        ? 'The provider response could not be parsed (even through the proxy). Verify this endpoint serves an [OI]-compatible /models list.'
+        : 'The provider response could not be parsed. Verify this endpoint serves an [OI]-compatible /models list.',
+      0,
+    );
   }
 }
 
@@ -274,33 +320,39 @@ export async function streamCompletion({
   const root = normalizeBaseUrl(baseUrl);
   if (!root) throw new ProviderError('Add a base URL for your provider first.', 0);
 
-  const response = await fetch(`${root}/chat/completions`, {
+  const requestBody = JSON.stringify({
+    model,
+    messages,
+    stream,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+  });
+
+  const requestInit: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: stream ? 'text/event-stream' : 'application/json',
       Authorization: `Bearer ${apiKey.trim()}`,
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      stream,
-      ...(stream ? { stream_options: { include_usage: true } } : {}),
-      ...(temperature !== undefined ? { temperature } : {}),
-      ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-    }),
+    body: requestBody,
     signal,
-  });
+  };
+
+  // Try the provider directly; fall back to the proxy if the browser request
+  // is CORS-blocked or otherwise fails before a response exists.
+  let response: Response;
+  try {
+    response = await fetch(`${root}/chat/completions`, requestInit);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    console.warn('Direct request failed, retrying through the CORS proxy.', error);
+    response = await fetch(proxiedUrl(`${root}/chat/completions`), requestInit);
+  }
 
   if (!response.ok) {
-    let message = `HTTP ${response.status}`;
-    try {
-      const body = (await response.json()) as { error?: { message?: string }; message?: string };
-      message = body?.error?.message ?? body?.message ?? message;
-    } catch {
-      // Non-JSON error body.
-    }
-    throw new ProviderError(message, response.status);
+    throw new ProviderError(await extractErrorMessage(response), response.status);
   }
 
   const contentType = response.headers.get('content-type') ?? '';
